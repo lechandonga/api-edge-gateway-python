@@ -26,12 +26,40 @@ class RateLimiter:
         self._rule = rule
         self._lock = threading.Lock()
         self._tokens = float(rule.burst)
-        self._last = 0.0
+        self._last: float | None = None
         self._quota_used = 0
 
     def check(self, now: float) -> RateDecision:
-        """判定一次请求是否放行；放行则消耗令牌与配额。"""
-        raise NotImplementedError
+        """判定一次请求是否放行；放行则消耗令牌与配额。
+
+        令牌补充与消耗、配额扣减都在同一把锁内完成，
+        并发下不会超发或丢失计数。
+        """
+        with self._lock:
+            if self._last is None:
+                self._last = now
+            # 按流逝时间补充令牌，封顶 burst
+            elapsed = max(0.0, now - self._last)
+            self._tokens = min(float(self._rule.burst),
+                               self._tokens + elapsed * self._rule.rate_per_second)
+            self._last = now
+
+            remaining_quota = (None if self._rule.quota is None
+                               else self._rule.quota - self._quota_used)
+
+            if self._tokens < 1.0:
+                # 速率超限：给出补满一个令牌所需的等待时间
+                wait = (1.0 - self._tokens) / self._rule.rate_per_second
+                return RateDecision(False, "rate_limited", self._tokens,
+                                    remaining_quota, wait)
+            if remaining_quota is not None and remaining_quota <= 0:
+                return RateDecision(False, "quota_exhausted", self._tokens, 0, None)
+
+            self._tokens -= 1.0
+            if self._rule.quota is not None:
+                self._quota_used += 1
+                remaining_quota = self._rule.quota - self._quota_used
+            return RateDecision(True, "ok", self._tokens, remaining_quota, None)
 
 
 class RateLimitRegistry:
@@ -42,8 +70,24 @@ class RateLimitRegistry:
         self._limiters: dict[str, RateLimiter] = {}
 
     def apply_rules(self, rules: tuple[RateLimitRule, ...]) -> None:
-        """应用新规则集：为新调用方建限流器，移除已删除的调用方。"""
+        """应用新规则集：为新调用方建限流器，移除已删除的调用方。
+
+        已存在且规则未变的调用方保留计数状态（不重置已用配额）。
+        """
+        with self._lock:
+            wanted = {r.caller: r for r in rules}
+            for caller in list(self._limiters):
+                if caller not in wanted:
+                    del self._limiters[caller]
+            for caller, rule in wanted.items():
+                existing = self._limiters.get(caller)
+                if existing is None or existing._rule != rule:
+                    self._limiters[caller] = RateLimiter(rule)
 
     def check(self, caller: str, now: float) -> RateDecision:
         """对指定调用方判定；无规则时默认放行。"""
-        raise NotImplementedError
+        with self._lock:
+            limiter = self._limiters.get(caller)
+        if limiter is None:
+            return RateDecision(True, "ok", 0.0, None, None)
+        return limiter.check(now)
