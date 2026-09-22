@@ -7,7 +7,7 @@
 
 ```bash
 uv sync
-uv run python main.py            # 网关监听 127.0.0.1:8080
+uv run python main.py            # 网关监听 127.0.0.1:18080
 uv run pytest                    # 运行全部测试（自动启动本地上游实例）
 ```
 

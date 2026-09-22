@@ -50,4 +50,4 @@ def load_config() -> dict:
 app = create_app(config_from_dict(load_config()))
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8080)
+    uvicorn.run(app, host="127.0.0.1", port=18080)
