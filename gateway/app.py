@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Request
@@ -111,7 +112,13 @@ class Gateway:
 def create_app(initial_config: GatewayConfig) -> FastAPI:
     """构建网关应用。"""
     gateway = Gateway(initial_config)
-    app = FastAPI(title="api-edge-gateway")
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        yield
+        await gateway.close()
+
+    app = FastAPI(title="api-edge-gateway", lifespan=lifespan)
     app.state.gateway = gateway
 
     @app.exception_handler(GatewayError)
@@ -143,9 +150,5 @@ def create_app(initial_config: GatewayConfig) -> FastAPI:
                                             "HEAD", "OPTIONS", "PATCH"])
     async def proxy(request: Request) -> Response:
         return await gateway.handle(request)
-
-    @app.on_event("shutdown")
-    async def shutdown() -> None:
-        await gateway.close()
 
     return app
