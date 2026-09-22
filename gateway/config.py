@@ -151,3 +151,62 @@ class ConfigStore:
         with self._lock:
             self._current = cfg
         return cfg
+
+
+def config_from_dict(data: dict) -> GatewayConfig:
+    """从字典（如 JSON 请求体）构建配置；字段非法抛 CONFIG_INVALID。"""
+    try:
+        routes = []
+        for r in data["routes"]:
+            b = r.get("breaker", {})
+            breaker = BreakerConfig(
+                failure_threshold=int(b.get("failure_threshold", 3)),
+                reset_timeout=float(b.get("reset_timeout", 5.0)),
+                half=int(b.get("half", 1)),
+                timeout_seconds=float(b.get("timeout_seconds", 2.0)),
+            )
+            ups = tuple(Upstream(name=u["name"], base_url=u["base_url"],
+                                 weight=int(u.get("weight", 1)))
+                        for u in r["upstreams"])
+            routes.append(Route(
+                name=r["name"], path_prefix=r["path_prefix"], upstreams=ups,
+                strategy=LBStrategy(r.get("strategy", "round_robin")),
+                breaker=breaker, max_retries=int(r.get("max_retries", 1))))
+        rules = tuple(RateLimitRule(
+            caller=rl["caller"],
+            rate_per_second=float(rl["rate_per_second"]),
+            burst=int(rl["burst"]),
+            quota=(None if rl.get("quota") is None else int(rl["quota"])),
+        ) for rl in data.get("rate_limits", []))
+        return GatewayConfig(routes=tuple(routes), rate_limits=rules,
+                             version=int(data.get("version", 0)))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise GatewayError(ErrorCode.CONFIG_INVALID,
+                           f"配置字段非法: {exc}", 400) from exc
+
+
+def config_to_dict(cfg: GatewayConfig) -> dict:
+    """把配置快照序列化为字典。"""
+    return {
+        "version": cfg.version,
+        "routes": [{
+            "name": r.name,
+            "path_prefix": r.path_prefix,
+            "strategy": r.strategy.value,
+            "max_retries": r.max_retries,
+            "upstreams": [{"name": u.name, "base_url": u.base_url,
+                           "weight": u.weight} for u in r.upstreams],
+            "breaker": {
+                "failure_threshold": r.breaker.failure_threshold,
+                "reset_timeout": r.breaker.reset_timeout,
+                "half": r.breaker.half,
+                "timeout_seconds": r.breaker.timeout_seconds,
+            },
+        } for r in cfg.routes],
+        "rate_limits": [{
+            "caller": rl.caller,
+            "rate_per_second": rl.rate_per_second,
+            "burst": rl.burst,
+            "quota": rl.quota,
+        } for rl in cfg.rate_limits],
+    }
