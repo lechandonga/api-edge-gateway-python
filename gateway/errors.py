@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Any
 
 
 class ErrorCode(str, Enum):
@@ -28,12 +29,14 @@ class GatewayError(Exception):
     """网关内部统一异常，携带对外错误码与 HTTP 状态。"""
 
     def __init__(self, code: ErrorCode, message: str, http_status: int = 502,
-                 retry_after: float | None = None) -> None:
+                 retry_after: float | None = None,
+                 rate_decision: Any | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.http_status = http_status
         self.retry_after = retry_after
+        self.rate_decision = rate_decision
 
     def to_dict(self) -> dict:
         body: dict = {"error": {"code": self.code.value, "message": self.message}}

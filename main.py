@@ -31,11 +31,33 @@ DEFAULT_CONFIG = {
             {"name": "u1", "base_url": "http://127.0.0.1:9001"},
             {"name": "u2", "base_url": "http://127.0.0.1:9002"},
         ],
+        # 默认组之外的灰度组：带 x-gray: true 头或 ?channel=beta 时进入
+        "backend_groups": [{
+            "name": "canary",
+            "strategy": "round_robin",
+            "upstreams": [
+                {"name": "c1", "base_url": "http://127.0.0.1:9003"},
+            ],
+        }],
+        "rules": [{
+            "name": "gray-by-header",
+            "group": "canary",
+            "conditions": [
+                {"kind": "header", "name": "x-gray", "values": ["true"]},
+            ],
+        }, {
+            "name": "gray-by-channel",
+            "group": "canary",
+            "conditions": [
+                {"kind": "query", "name": "channel", "values": ["beta"]},
+            ],
+        }],
         "breaker": {"failure_threshold": 3, "reset_timeout": 5.0,
                     "half": 1, "timeout_seconds": 2.0},
     }],
     "rate_limits": [
-        {"caller": "anonymous", "rate_per_second": 20, "burst": 40},
+        {"caller": "anonymous", "rate_per_second": 20, "burst": 40,
+         "quota": 10000, "quota_window_seconds": 3600},
     ],
 }
 

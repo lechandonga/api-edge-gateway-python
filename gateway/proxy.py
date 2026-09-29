@@ -8,7 +8,7 @@ import time
 import httpx
 
 from .breaker import CircuitBreaker
-from .config import Route, Upstream
+from .config import BackendGroup, BreakerConfig, Upstream
 from .errors import ErrorCode, GatewayError
 from .loadbalancer import LoadBalancer
 
@@ -19,14 +19,23 @@ logger = logging.getLogger("gateway.proxy")
 
 
 class ProxyEngine:
-    """按路由转发请求，组合负载均衡、熔断与重试。"""
+    """按后端组转发请求，组合负载均衡、熔断与重试。
 
-    def __init__(self, route: Route, client: httpx.AsyncClient) -> None:
-        self._route = route
+    引擎与具体（路由, 后端组）绑定；配置切换/回退时按内容指纹复用，
+    进行中请求持有的引擎引用永远有效、不会被原地修改。
+    """
+
+    def __init__(self, route_name: str, group: BackendGroup,
+                 breaker_config: BreakerConfig,
+                 client: httpx.AsyncClient) -> None:
+        self._route_name = route_name
+        self._group = group
+        self._breaker_config = breaker_config
         self._client = client
-        self._lb = LoadBalancer(route)
+        self._lb = LoadBalancer(group)
         self._breakers: dict[str, CircuitBreaker] = {
-            u.name: CircuitBreaker(u.name, route.breaker) for u in route.upstreams
+            u.name: CircuitBreaker(u.name, breaker_config)
+            for u in group.upstreams
         }
 
     def breakers(self) -> dict[str, CircuitBreaker]:
@@ -37,7 +46,7 @@ class ProxyEngine:
         url = upstream.base_url.rstrip("/") + path
         return await self._client.request(
             method, url, headers=headers, content=body,
-            timeout=self._route.breaker.timeout_seconds)
+            timeout=self._breaker_config.timeout_seconds)
 
     async def forward(self, method: str, path: str, headers: dict[str, str],
                       body: bytes) -> httpx.Response:
@@ -48,9 +57,10 @@ class ProxyEngine:
         """
         method = method.upper()
         idempotent = method in IDEMPOTENT_METHODS
-        attempts = 1 + (self._route.max_retries if idempotent else 0)
-        logger.info("request %s %s route=%s idempotent=%s attempts=%d",
-                    method, path, self._route.name, idempotent, attempts)
+        attempts = 1 + (self._group.max_retries if idempotent else 0)
+        logger.info("request %s %s route=%s group=%s idempotent=%s attempts=%d",
+                    method, path, self._route_name, self._group.name,
+                    idempotent, attempts)
 
         last_error: GatewayError | None = None
         tried: set[str] = set()
@@ -59,7 +69,7 @@ class ProxyEngine:
             upstream: Upstream | None = None
             breaker: CircuitBreaker | None = None
             now = time.monotonic()
-            pool = [u for u in self._route.upstreams if u.name not in tried]
+            pool = [u for u in self._group.upstreams if u.name not in tried]
             for _ in range(len(pool) + 1):
                 try:
                     candidate = self._lb.pick(exclude=tried)
@@ -86,7 +96,7 @@ class ProxyEngine:
                 breaker.on_failure(time.monotonic())
                 last_error = GatewayError(
                     ErrorCode.UPSTREAM_TIMEOUT,
-                    f"上游 {upstream.name} 超时（>{self._route.breaker.timeout_seconds}s）",
+                    f"上游 {upstream.name} 超时（>{self._breaker_config.timeout_seconds}s）",
                     504)
                 logger.info("upstream timeout upstream=%s attempt=%d",
                             upstream.name, attempt + 1)
@@ -119,4 +129,5 @@ class ProxyEngine:
         if last_error is not None:
             raise last_error
         raise GatewayError(ErrorCode.NO_HEALTHY_UPSTREAM,
-                           f"路由 {self._route.name} 无可用上游实例", 503)
+                           f"路由 {self._route_name} 后端组 {self._group.name} "
+                           f"无可用上游实例", 503)
