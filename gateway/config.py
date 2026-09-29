@@ -2,11 +2,15 @@
 
 配置以不可变快照形式整体替换：校验通过后一次性生效，
 进行中的请求仍持有旧快照引用，不受切换影响。
+
+每次成功提交（含回退）都会追加一条不可变的变更记录，
+支持查询历史并回退到任意一次记录。
 """
 
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -34,6 +38,20 @@ class RateLimitRule:
     rate_per_second: float       # 每秒允许的请求数（令牌桶速率）
     burst: int                   # 突发容量
     quota: int | None = None     # 总配额，None 表示不限
+    quota_period_seconds: float | None = None  # 配额周期；None 表示累计不重置
+
+
+@dataclass(frozen=True)
+class SplitRule:
+    """路由下的分流规则：按请求头或查询参数把流量引到指定上游组。
+
+    同一路由内规则按配置顺序求值，先命中先生效；都未命中走默认上游组。
+    """
+    name: str
+    match_kind: str              # "header" 或 "query"
+    match_key: str               # 请求头名或查询参数名
+    match_value: str             # 期望的值（精确匹配）
+    upstreams: tuple[Upstream, ...]
 
 
 @dataclass(frozen=True)
@@ -54,6 +72,7 @@ class Route:
     strategy: LBStrategy = LBStrategy.ROUND_ROBIN
     breaker: BreakerConfig = field(default_factory=BreakerConfig)
     max_retries: int = 1             # 仅对可安全重放（幂等）的请求生效
+    rules: tuple[SplitRule, ...] = ()  # 分流规则，按顺序求值
 
 
 @dataclass(frozen=True)
@@ -72,6 +91,24 @@ def validate_config(cfg: GatewayConfig) -> None:
     """
     if not cfg.routes:
         raise GatewayError(ErrorCode.CONFIG_INVALID, "至少需要一个路由", 400)
+
+    def check_upstreams(owner: str, upstreams: tuple[Upstream, ...]) -> None:
+        if not upstreams:
+            raise GatewayError(ErrorCode.CONFIG_INVALID,
+                               f"{owner} 至少需要一个上游实例", 400)
+        up_names: set[str] = set()
+        for up in upstreams:
+            if not up.name or not up.base_url.startswith(("http://", "https://")):
+                raise GatewayError(
+                    ErrorCode.CONFIG_INVALID,
+                    f"{owner} 的上游 {up.name!r} 名称或 base_url 非法", 400)
+            if up.name in up_names:
+                raise GatewayError(ErrorCode.CONFIG_CONFLICT,
+                                   f"{owner} 内上游名重复: {up.name}", 409)
+            up_names.add(up.name)
+            if up.weight <= 0:
+                raise GatewayError(ErrorCode.CONFIG_INVALID,
+                                   f"上游 {up.name} 权重必须为正整数", 400)
 
     seen_names: set[str] = set()
     seen_prefixes: list[str] = []
@@ -94,22 +131,7 @@ def validate_config(cfg: GatewayConfig) -> None:
                     f"路由前缀冲突: {route.path_prefix!r} 与 {p!r} 互相包含", 409)
         seen_prefixes.append(route.path_prefix)
 
-        if not route.upstreams:
-            raise GatewayError(ErrorCode.CONFIG_INVALID,
-                               f"路由 {route.name} 至少需要一个上游实例", 400)
-        up_names: set[str] = set()
-        for up in route.upstreams:
-            if not up.name or not up.base_url.startswith(("http://", "https://")):
-                raise GatewayError(
-                    ErrorCode.CONFIG_INVALID,
-                    f"路由 {route.name} 的上游 {up.name!r} 名称或 base_url 非法", 400)
-            if up.name in up_names:
-                raise GatewayError(ErrorCode.CONFIG_CONFLICT,
-                                   f"路由 {route.name} 内上游名重复: {up.name}", 409)
-            up_names.add(up.name)
-            if up.weight <= 0:
-                raise GatewayError(ErrorCode.CONFIG_INVALID,
-                                   f"上游 {up.name} 权重必须为正整数", 400)
+        check_upstreams(f"路由 {route.name}", route.upstreams)
         if route.max_retries < 0:
             raise GatewayError(ErrorCode.CONFIG_INVALID,
                                f"路由 {route.name} 的 max_retries 不能为负", 400)
@@ -117,6 +139,35 @@ def validate_config(cfg: GatewayConfig) -> None:
         if b.failure_threshold <= 0 or b.reset_timeout <= 0 or b.timeout_seconds <= 0:
             raise GatewayError(ErrorCode.CONFIG_INVALID,
                                f"路由 {route.name} 的熔断参数必须为正", 400)
+
+        # 分流规则：条件必须确定、互不重复，否则任何排序都无法消歧
+        rule_names: set[str] = set()
+        seen_conditions: set[tuple[str, str, str]] = set()
+        for rule in route.rules:
+            if not rule.name:
+                raise GatewayError(ErrorCode.CONFIG_INVALID,
+                                   f"路由 {route.name} 的分流规则名不能为空", 400)
+            if rule.name in rule_names:
+                raise GatewayError(
+                    ErrorCode.CONFIG_CONFLICT,
+                    f"路由 {route.name} 的分流规则名重复: {rule.name}", 409)
+            rule_names.add(rule.name)
+            if rule.match_kind not in ("header", "query"):
+                raise GatewayError(
+                    ErrorCode.CONFIG_INVALID,
+                    f"分流规则 {rule.name} 的 match 类型必须是 header 或 query", 400)
+            if not rule.match_key or not rule.match_value:
+                raise GatewayError(
+                    ErrorCode.CONFIG_INVALID,
+                    f"分流规则 {rule.name} 的匹配键与值不能为空", 400)
+            cond = (rule.match_kind, rule.match_key.lower(), rule.match_value)
+            if cond in seen_conditions:
+                raise GatewayError(
+                    ErrorCode.CONFIG_CONFLICT,
+                    f"路由 {route.name} 的分流匹配条件重复: "
+                    f"{rule.match_kind} {rule.match_key}={rule.match_value}", 409)
+            seen_conditions.add(cond)
+            check_upstreams(f"分流规则 {rule.name}", rule.upstreams)
 
     seen_callers: set[str] = set()
     for rule in cfg.rate_limits:
@@ -132,25 +183,74 @@ def validate_config(cfg: GatewayConfig) -> None:
         if rule.quota is not None and rule.quota < 0:
             raise GatewayError(ErrorCode.CONFIG_INVALID,
                                f"调用方 {rule.caller} 的配额不能为负", 400)
+        if rule.quota_period_seconds is not None and rule.quota_period_seconds <= 0:
+            raise GatewayError(ErrorCode.CONFIG_INVALID,
+                               f"调用方 {rule.caller} 的配额周期必须为正", 400)
+
+
+@dataclass(frozen=True)
+class ConfigRevision:
+    """一次成功提交的变更记录（不可变）。"""
+    revision: int                  # 单调递增的内部修订号
+    timestamp: float               # 提交时间（time.time()）
+    config: GatewayConfig
+    rolled_back_to: int | None = None  # 若是回退产生，指向来源修订号
 
 
 class ConfigStore:
-    """线程安全的配置持有者：读取返回当前快照，更新整体原子替换。"""
+    """线程安全的配置持有者：读取返回当前快照，更新整体原子替换。
+
+    每次成功变更（提交或回退）追加一条 ConfigRevision 记录，
+    历史只增不改，可回退到任意一条记录。
+    """
 
     def __init__(self, initial: GatewayConfig) -> None:
         validate_config(initial)
         self._lock = threading.Lock()
         self._current = initial
+        self._history: list[ConfigRevision] = [
+            ConfigRevision(1, time.time(), initial)]
+        self._next_revision = 2
 
     def get(self) -> GatewayConfig:
         return self._current
 
-    def update(self, cfg: GatewayConfig) -> GatewayConfig:
+    def current_revision(self) -> int:
+        return self._history[-1].revision
+
+    def update(self, cfg: GatewayConfig) -> ConfigRevision:
         """校验并原子替换；失败时旧配置保持不变。"""
         validate_config(cfg)  # 校验失败直接抛出，不触碰旧配置
         with self._lock:
+            rev = ConfigRevision(self._next_revision, time.time(), cfg)
+            self._next_revision += 1
             self._current = cfg
-        return cfg
+            self._history.append(rev)
+        return rev
+
+    def history(self, limit: int = 20) -> list[ConfigRevision]:
+        """最近的变更记录，新的在前。"""
+        with self._lock:
+            return list(reversed(self._history[-limit:]))
+
+    def rollback(self, revision: int) -> ConfigRevision:
+        """回退到指定修订号的配置；目标记录作为新的当前配置立即生效。
+
+        历史不被修改：回退本身也追加一条记录（rolled_back_to 指向来源）。
+        修订号不存在时抛错，当前配置保持不变。
+        """
+        with self._lock:
+            target = next((r for r in self._history if r.revision == revision),
+                          None)
+            if target is None:
+                raise GatewayError(ErrorCode.REVISION_NOT_FOUND,
+                                   f"变更记录不存在: revision={revision}", 404)
+            rev = ConfigRevision(self._next_revision, time.time(),
+                                 target.config, rolled_back_to=revision)
+            self._next_revision += 1
+            self._current = target.config
+            self._history.append(rev)
+        return rev
 
 
 def config_from_dict(data: dict) -> GatewayConfig:
@@ -168,15 +268,34 @@ def config_from_dict(data: dict) -> GatewayConfig:
             ups = tuple(Upstream(name=u["name"], base_url=u["base_url"],
                                  weight=int(u.get("weight", 1)))
                         for u in r["upstreams"])
+            rules = []
+            for sr in r.get("rules", []):
+                m = sr.get("match", {})
+                kind = "header" if "header" in m else "query"
+                key = m.get(kind)
+                if key is None:
+                    raise KeyError("match.header 或 match.query")
+                rule_ups = tuple(
+                    Upstream(name=u["name"], base_url=u["base_url"],
+                             weight=int(u.get("weight", 1)))
+                    for u in sr["upstreams"])
+                rules.append(SplitRule(
+                    name=sr["name"], match_kind=kind, match_key=str(key),
+                    match_value=str(m.get("value", "")),
+                    upstreams=rule_ups))
             routes.append(Route(
                 name=r["name"], path_prefix=r["path_prefix"], upstreams=ups,
                 strategy=LBStrategy(r.get("strategy", "round_robin")),
-                breaker=breaker, max_retries=int(r.get("max_retries", 1))))
+                breaker=breaker, max_retries=int(r.get("max_retries", 1)),
+                rules=tuple(rules)))
         rules = tuple(RateLimitRule(
             caller=rl["caller"],
             rate_per_second=float(rl["rate_per_second"]),
             burst=int(rl["burst"]),
             quota=(None if rl.get("quota") is None else int(rl["quota"])),
+            quota_period_seconds=(
+                None if rl.get("quota_period_seconds") is None
+                else float(rl["quota_period_seconds"])),
         ) for rl in data.get("rate_limits", []))
         return GatewayConfig(routes=tuple(routes), rate_limits=rules,
                              version=int(data.get("version", 0)))
@@ -196,6 +315,12 @@ def config_to_dict(cfg: GatewayConfig) -> dict:
             "max_retries": r.max_retries,
             "upstreams": [{"name": u.name, "base_url": u.base_url,
                            "weight": u.weight} for u in r.upstreams],
+            "rules": [{
+                "name": sr.name,
+                "match": {sr.match_kind: sr.match_key, "value": sr.match_value},
+                "upstreams": [{"name": u.name, "base_url": u.base_url,
+                               "weight": u.weight} for u in sr.upstreams],
+            } for sr in r.rules],
             "breaker": {
                 "failure_threshold": r.breaker.failure_threshold,
                 "reset_timeout": r.breaker.reset_timeout,
@@ -208,5 +333,6 @@ def config_to_dict(cfg: GatewayConfig) -> dict:
             "rate_per_second": rl.rate_per_second,
             "burst": rl.burst,
             "quota": rl.quota,
+            "quota_period_seconds": rl.quota_period_seconds,
         } for rl in cfg.rate_limits],
     }

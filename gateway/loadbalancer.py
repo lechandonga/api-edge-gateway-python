@@ -5,32 +5,35 @@ from __future__ import annotations
 import random
 import threading
 
-from .config import LBStrategy, Route, Upstream
+from .config import LBStrategy, Upstream
 from .errors import ErrorCode, GatewayError
 
 
 class LoadBalancer:
-    """单个路由的负载均衡器，内部状态线程安全。"""
+    """单个上游组的负载均衡器，内部状态线程安全。"""
 
-    def __init__(self, route: Route) -> None:
-        self._route = route
+    def __init__(self, group: str, upstreams: tuple[Upstream, ...],
+                 strategy: LBStrategy) -> None:
+        self._group = group
+        self._upstreams = upstreams
+        self._strategy = strategy
         self._lock = threading.Lock()
         self._rr_index = 0
-        self._inflight: dict[str, int] = {u.name: 0 for u in route.upstreams}
+        self._inflight: dict[str, int] = {u.name: 0 for u in upstreams}
         # 按权重展开的轮询序列
         self._weighted: list[Upstream] = [
-            u for u in route.upstreams for _ in range(u.weight)
+            u for u in upstreams for _ in range(u.weight)
         ]
 
     def pick(self, exclude: set[str] | None = None) -> Upstream:
         """按策略选择一个上游实例；exclude 中的实例本轮不参与。"""
         exclude = exclude or set()
         with self._lock:
-            candidates = [u for u in self._route.upstreams if u.name not in exclude]
+            candidates = [u for u in self._upstreams if u.name not in exclude]
             if not candidates:
                 raise GatewayError(ErrorCode.NO_HEALTHY_UPSTREAM,
-                                   f"路由 {self._route.name} 无可用上游实例", 503)
-            strategy = self._route.strategy
+                                   f"上游组 {self._group} 无可用上游实例", 503)
+            strategy = self._strategy
             if strategy is LBStrategy.RANDOM:
                 return random.choice(candidates)
             if strategy is LBStrategy.LEAST_CONNECTIONS:

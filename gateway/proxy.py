@@ -19,14 +19,23 @@ logger = logging.getLogger("gateway.proxy")
 
 
 class ProxyEngine:
-    """按路由转发请求，组合负载均衡、熔断与重试。"""
+    """按上游组转发请求，组合负载均衡、熔断与重试。
 
-    def __init__(self, route: Route, client: httpx.AsyncClient) -> None:
+    一个路由的默认上游组或某条分流规则的上游组各对应一个引擎，
+    各自持有独立的负载均衡器与熔断器集合。
+    """
+
+    def __init__(self, route: Route, client: httpx.AsyncClient,
+                 group: str = "", upstreams: tuple[Upstream, ...] | None = None
+                 ) -> None:
         self._route = route
+        self._group = group or route.name
+        self._upstreams = upstreams if upstreams is not None else route.upstreams
         self._client = client
-        self._lb = LoadBalancer(route)
+        self._lb = LoadBalancer(self._group, self._upstreams, route.strategy)
         self._breakers: dict[str, CircuitBreaker] = {
-            u.name: CircuitBreaker(u.name, route.breaker) for u in route.upstreams
+            u.name: CircuitBreaker(u.name, route.breaker)
+            for u in self._upstreams
         }
 
     def breakers(self) -> dict[str, CircuitBreaker]:
@@ -49,8 +58,9 @@ class ProxyEngine:
         method = method.upper()
         idempotent = method in IDEMPOTENT_METHODS
         attempts = 1 + (self._route.max_retries if idempotent else 0)
-        logger.info("request %s %s route=%s idempotent=%s attempts=%d",
-                    method, path, self._route.name, idempotent, attempts)
+        logger.info("request %s %s route=%s group=%s idempotent=%s attempts=%d",
+                    method, path, self._route.name, self._group,
+                    idempotent, attempts)
 
         last_error: GatewayError | None = None
         tried: set[str] = set()
@@ -59,7 +69,7 @@ class ProxyEngine:
             upstream: Upstream | None = None
             breaker: CircuitBreaker | None = None
             now = time.monotonic()
-            pool = [u for u in self._route.upstreams if u.name not in tried]
+            pool = [u for u in self._upstreams if u.name not in tried]
             for _ in range(len(pool) + 1):
                 try:
                     candidate = self._lb.pick(exclude=tried)
@@ -119,4 +129,4 @@ class ProxyEngine:
         if last_error is not None:
             raise last_error
         raise GatewayError(ErrorCode.NO_HEALTHY_UPSTREAM,
-                           f"路由 {self._route.name} 无可用上游实例", 503)
+                           f"上游组 {self._group} 无可用上游实例", 503)

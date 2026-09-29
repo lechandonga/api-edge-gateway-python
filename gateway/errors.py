@@ -11,6 +11,7 @@ class ErrorCode(str, Enum):
     # 配置类
     CONFIG_INVALID = "config_invalid"          # 配置非法（字段缺失/类型错误）
     CONFIG_CONFLICT = "config_conflict"        # 配置冲突（重复路由/上游引用不存在）
+    REVISION_NOT_FOUND = "revision_not_found"  # 回退目标变更记录不存在
     # 限流类
     RATE_LIMITED = "rate_limited"              # 超出速率窗口
     QUOTA_EXHAUSTED = "quota_exhausted"        # 配额耗尽
@@ -28,15 +29,18 @@ class GatewayError(Exception):
     """网关内部统一异常，携带对外错误码与 HTTP 状态。"""
 
     def __init__(self, code: ErrorCode, message: str, http_status: int = 502,
-                 retry_after: float | None = None) -> None:
+                 retry_after: float | None = None,
+                 details: dict | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
         self.http_status = http_status
         self.retry_after = retry_after
+        self.details = details or {}
 
     def to_dict(self) -> dict:
         body: dict = {"error": {"code": self.code.value, "message": self.message}}
         if self.retry_after is not None:
             body["error"]["retry_after"] = self.retry_after
+        body["error"].update(self.details)
         return body
